@@ -1,0 +1,7 @@
+.env
+node_modules
+*.zip
+JockieMusic
+musicapdk_deploy
+test_*.js
+.git
