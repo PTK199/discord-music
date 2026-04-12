@@ -4,6 +4,14 @@ const fs = require('fs');
 const path = require('path');
 const playdl = require('play-dl');
 
+// ── Proteção contra crash (Discloud/Docker) ──
+process.on('uncaughtException', (err) => {
+    console.error('[FATAL] Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 // ── FFmpeg ──
 try {
     const fp = require('ffmpeg-static');

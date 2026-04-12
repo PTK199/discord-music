@@ -1,4 +1,4 @@
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, NoSubscriberBehavior } = require('@discordjs/voice');
 const playdl = require('play-dl');
 const spotify = require('../spotify.js');
 
@@ -33,10 +33,12 @@ async function playNext(guildId) {
     const g = getGuild(guildId);
     if (!g.tracks.length) {
         g.current = null;
-        g.textChannel?.send('✅ | Fila acabou.').catch(() => {});
+        if (g.textChannel) g.textChannel.send('✅ | Fila acabou.').catch(() => {});
         // Sai do canal depois de 5 min sem música
         g.leaveTimer = setTimeout(() => {
-            if (g.connection) { g.connection.destroy(); }
+            if (g.connection) { 
+                try { g.connection.destroy(); } catch (e) {} 
+            }
             guilds.delete(guildId);
         }, 300000);
         return;
@@ -50,12 +52,16 @@ async function playNext(guildId) {
         const stream = await playdl.stream(track.url);
         const resource = createAudioResource(stream.stream, { inputType: stream.type, inlineVolume: true });
         resource.volume.setVolume(g.volume); // Aplica volume salvo
-        g.player.play(resource);
-        console.log(`[▶] ${track.title}`);
-        g.textChannel?.send(`▶️ | **${track.title}**`).catch(() => {});
+        
+        // Proteção extra: ignora erro de tentar tocar no player destruido
+        if (g.player) {
+            g.player.play(resource);
+            console.log(`[▶] ${track.title}`);
+            if (g.textChannel) g.textChannel.send(`▶️ | **${track.title}**`).catch(() => {});
+        }
     } catch (e) {
         console.error(`[stream err] ${track.title}:`, e.message);
-        g.textChannel?.send(`❌ | Erro ao tocar **${track.title}**: ${e.message}`).catch(() => {});
+        if (g.textChannel) g.textChannel.send(`❌ | Erro ao tocar **${track.title}**: ${e.message}`).catch(() => {});
         playNext(guildId); // Pula pra próxima
     }
 }
@@ -156,18 +162,60 @@ module.exports.execute = async function (message, args) {
                 selfDeaf: true,
             });
 
-            g.player = createAudioPlayer();
+            g.player = createAudioPlayer({
+                behaviors: {
+                    noSubscriber: NoSubscriberBehavior.Play
+                }
+            });
             g.connection.subscribe(g.player);
 
             g.player.on(AudioPlayerStatus.Idle, () => playNext(message.guild.id));
             g.player.on('error', (e) => {
                 console.error('[player err]', e.message);
-                g.textChannel?.send(`❌ | Erro: ${e.message}`).catch(() => {});
+                if (g.textChannel) g.textChannel.send(`❌ | Erro: ${e.message}`).catch(() => {});
                 playNext(message.guild.id);
             });
 
-            g.connection.on(VoiceConnectionStatus.Disconnected, () => {
+            // Proteção contra threads zumbis no Docker
+            g.player.on('stateChange', (oldState, newState) => {
+                if (newState.status === AudioPlayerStatus.AutoPaused) {
+                    console.error('[player err] Áudio congelou. Pulando travamento forçadamente...');
+                    playNext(message.guild.id);
+                }
+            });
+
+            g.connection.on('error', (e) => {
+                console.error('[voice err]', e.message);
+                if (g.textChannel) g.textChannel.send(`❌ | Erro de conexão de voz: ${e.message}`).catch(() => {});
+                try { g.connection.destroy(); } catch (err) {}
                 guilds.delete(message.guild.id);
+            });
+
+            g.connection.on(VoiceConnectionStatus.Disconnected, async (oldState, newState) => {
+                try {
+                    await Promise.race([
+                        entersState(g.connection, VoiceConnectionStatus.Signalling, 5_000),
+                        entersState(g.connection, VoiceConnectionStatus.Connecting, 5_000),
+                    ]);
+                    // Reconectou
+                } catch (error) {
+                    try { g.connection.destroy(); } catch (err) {}
+                    guilds.delete(message.guild.id);
+                }
+            });
+
+            // Workaround para impedir que o heartbeat UDP trave e pare o áudio nas streams longas da Discloud
+            g.connection.on('stateChange', (oldState, newState) => {
+                const oldNetworking = Reflect.get(oldState, 'networking');
+                const newNetworking = Reflect.get(newState, 'networking');
+
+                const networkStateChangeHandler = (oldNetworkState, newNetworkState) => {
+                    const newUdp = Reflect.get(newNetworkState, 'udp');
+                    clearInterval(newUdp?.keepAliveInterval);
+                };
+
+                oldNetworking?.off('stateChange', networkStateChangeHandler);
+                newNetworking?.on('stateChange', networkStateChangeHandler);
             });
         }
 
